@@ -75,6 +75,7 @@ type Conn struct {
 	xid              uint32
 	sessionTimeoutMs int32 // session timeout in milliseconds
 	passwd           []byte
+	readOnly         bool
 
 	dialer         Dialer
 	hostProvider   HostProvider
@@ -229,10 +230,30 @@ func Connect(servers []string, sessionTimeout time.Duration, options ...connOpti
 	return conn, ec, nil
 }
 
+// WithAuthData returns a connection option specifying a AuthData
+func WithAuthData(scheme string, auth []byte) connOption {
+	return func(c *Conn) {
+		obj := authCreds{
+			scheme: scheme,
+			auth:   auth,
+		}
+		c.credsMu.Lock()
+		c.creds = append(c.creds, obj)
+		c.credsMu.Unlock()
+	}
+}
+
 // WithDialer returns a connection option specifying a non-default Dialer.
 func WithDialer(dialer Dialer) connOption {
 	return func(c *Conn) {
 		c.dialer = dialer
+	}
+}
+
+// WithAllowReadOnly returns a connection option specifying allow connecting to read-only zk.
+func WithAllowReadOnly(allow bool) connOption {
+	return func(c *Conn) {
+		c.readOnly = allow
 	}
 }
 
@@ -398,6 +419,40 @@ func (c *Conn) connect() error {
 	}
 }
 
+// sendRequestEx sends request directly, and handles the closed or quit scenarios.
+func (c *Conn) sendRequestEx(
+	ctx context.Context,
+	opcode int32,
+	req interface{},
+	res interface{},
+	recvFunc func(*request, *responseHeader, error)) (bool, error) {
+
+	resChan, err := c.sendRequest(opcode, req, res, recvFunc)
+
+	if err != nil {
+		return true, fmt.Errorf("failed to send auth request: %v", err)
+	}
+
+	var resp response
+
+	select {
+	case resp = <-resChan:
+	case <-c.closeChan:
+		c.logger.Printf("recv routine closed")
+		return false, nil
+	case <-c.shouldQuit:
+		c.logger.Printf("should quit")
+		return false, nil
+	case <-ctx.Done():
+		return false, ctx.Err()
+	}
+
+	if resp.err != nil {
+		return true, fmt.Errorf("failed for op: %d, error: %v", opcode, resp.err)
+	}
+	return true, nil
+}
+
 func (c *Conn) sendRequest(
 	opcode int32,
 	req interface{},
@@ -424,6 +479,7 @@ func (c *Conn) sendRequest(
 }
 
 func (c *Conn) loop(ctx context.Context) {
+	go c.pingForRW()
 	for {
 		if err := c.connect(); err != nil {
 			// c.Close() was called
@@ -638,6 +694,7 @@ func (c *Conn) authenticate() error {
 		TimeOut:         c.sessionTimeoutMs,
 		SessionID:       c.SessionID(),
 		Passwd:          c.passwd,
+		ReadOnly:        c.readOnly,
 	})
 	if err != nil {
 		return err
@@ -686,9 +743,54 @@ func (c *Conn) authenticate() error {
 	atomic.StoreInt64(&c.sessionID, r.SessionID)
 	c.setTimeouts(r.TimeOut)
 	c.passwd = r.Passwd
-	c.setState(StateHasSession)
+	if r.ReadOnly {
+		c.setState(StateConnectedReadOnly)
+	} else {
+		c.setState(StateHasSession)
+	}
 
 	return nil
+}
+
+
+func (c *Conn) pingForRW() {
+	c.logger.Printf("Start to ping for RW server.")
+	for {
+		select {
+		case <-c.shouldQuit:
+			c.logger.Printf("Should quit.")
+			return
+		default:
+		}
+		if c.State() == StateConnectedReadOnly {
+			if c.logInfo {
+				c.logger.Printf("Try to find a RW server.")
+			}
+			server, _ := c.hostProvider.Next()
+			if FLWIsRW(server, 2*time.Second) {
+				// note(linsite)
+				// We cannot close closeChan which will trigger a double-close panic.
+				// Only send an item a time, which may not be enough as there are more than 1 consumer of closeChan.
+				// But that's OK, because we are in a loop.
+				func() {
+					// Catch closed panic.
+					defer func() {
+						_ = recover()
+					}()
+					c.closeChan <- struct{}{}
+				}()
+				time.Sleep(1 * time.Second)
+				continue
+			} else {
+				// Mark current connectec, so that hostProvider can find a RW server faster.
+				c.hostProvider.Connected()
+			}
+			// loop faster to reconnected to RW server.
+			time.Sleep(3 * time.Second)
+			continue
+		}
+		time.Sleep(5 * time.Second)
+	}
 }
 
 func (c *Conn) sendData(req *request) error {
@@ -936,8 +1038,34 @@ func (c *Conn) request(opcode int32, req interface{}, res interface{}, recvFunc 
 	}
 }
 
+func (c *Conn) doAddSaslAuth(auth []byte) (int64, error) {
+	// step 1 Ask for server informations.
+	resp := setSaslResponse{}
+
+	zxid, err := c.request(opSetSasl, &setSaslRequest{}, &resp, nil)
+	if err != nil {
+		return zxid, err
+	}
+
+	challenge, err := resp.GenSaslChallenge(auth, "")
+
+	if err != nil {
+		return 0, err
+	}
+
+	// step 2 Do the authentication.
+	return c.request(opSetSasl, &setSaslRequest{challenge}, &resp, nil)
+}
+
+// AddAuth adds an auth specified by <scheme> and <auth>, supported schemes
+// includes "digest", "sasl", <auth> usually comes as "user:pasword".
 func (c *Conn) AddAuth(scheme string, auth []byte) error {
-	_, err := c.request(opSetAuth, &setAuthRequest{Type: 0, Scheme: scheme, Auth: auth}, &setAuthResponse{}, nil)
+	var err error
+	if scheme == "sasl" {
+		_, err = c.doAddSaslAuth(auth)
+	} else {
+		_, err = c.request(opSetAuth, &setAuthRequest{Type: 0, Scheme: scheme, Auth: auth}, &setAuthResponse{}, nil)
+	}
 
 	if err != nil {
 		return err
@@ -1303,6 +1431,24 @@ func (c *Conn) Server() string {
 	return c.server
 }
 
+// FIXME(linsite) unify it with doAddSasl.
+// resendZkSasl resends SASL auth, when the 1st return value is true indicates the connection is invalid.
+func resendZkSasl(ctx context.Context, c *Conn, auth []byte) (bool, error) {
+	resp := setSaslResponse{}
+	shouldContinue, err := c.sendRequestEx(ctx, opSetSasl, &setSaslRequest{}, &resp, nil)
+	if err != nil {
+		return shouldContinue, err
+	}
+
+	challenge, err := resp.GenSaslChallenge(auth, "")
+
+	if err != nil {
+		return true, err
+	}
+
+	return c.sendRequestEx(ctx, opSetSasl, &setSaslRequest{challenge}, &resp, nil)
+}
+
 func resendZkAuth(ctx context.Context, c *Conn) error {
 	shouldCancel := func() bool {
 		select {
@@ -1322,6 +1468,9 @@ func resendZkAuth(ctx context.Context, c *Conn) error {
 		c.logger.Printf("re-submitting `%d` credentials after reconnect", len(c.creds))
 	}
 
+	var shouldContinue bool
+	var err error
+
 	for _, cred := range c.creds {
 		// return early before attempting to send request.
 		if shouldCancel() {
@@ -1329,33 +1478,26 @@ func resendZkAuth(ctx context.Context, c *Conn) error {
 		}
 		// do not use the public API for auth since it depends on the send/recv loops
 		// that are waiting for this to return
-		resChan, err := c.sendRequest(
-			opSetAuth,
-			&setAuthRequest{Type: 0,
-				Scheme: cred.scheme,
-				Auth:   cred.auth,
-			},
-			&setAuthResponse{},
-			nil, /* recvFunc*/
-		)
-		if err != nil {
-			return fmt.Errorf("failed to send auth request: %v", err)
-		}
 
-		var res response
-		select {
-		case res = <-resChan:
-		case <-c.closeChan:
-			c.logger.Printf("recv closed, cancel re-submitting credentials")
-			return nil
-		case <-c.shouldQuit:
-			c.logger.Printf("should quit, cancel re-submitting credentials")
-			return nil
-		case <-ctx.Done():
-			return ctx.Err()
+		if cred.scheme == "sasl" {
+			shouldContinue, err = resendZkSasl(ctx, c, cred.auth)
+		} else {
+			shouldContinue, err = c.sendRequestEx(
+				ctx,
+				opSetAuth,
+				&setAuthRequest{Type: 0,
+					Scheme: cred.scheme,
+					Auth:   cred.auth,
+				},
+				&setAuthResponse{},
+				nil, /* recvFunc*/
+			)
 		}
-		if res.err != nil {
-			return fmt.Errorf("failed conneciton setAuth request: %v", res.err)
+		if err != nil {
+			if shouldContinue {
+				continue
+			}
+			return err
 		}
 	}
 
